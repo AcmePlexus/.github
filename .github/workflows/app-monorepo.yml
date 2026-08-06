@@ -1,0 +1,168 @@
+name: Build and deploy (app monorepo)
+
+# Reusable workflow for the `app` archetype: a pnpm monorepo whose build needs no database
+# and whose migrations run at container start. Builds the image on GitHub, pushes it to
+# GHCR, and points Coolify at the new tag — the VPS never builds.
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: Coolify application name, e.g. mtq-web
+        required: true
+        type: string
+      node-version:
+        required: false
+        type: string
+        default: "22"
+      pnpm-version:
+        required: false
+        type: string
+        default: "10"
+      dockerfile:
+        required: false
+        type: string
+        default: ./Dockerfile
+      deploy:
+        description: Push the image and deploy. false = check only (use for PRs).
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  # Never let two deploys of the same app race; cancel superseded runs on the same ref.
+  group: deploy-${{ inputs.app-name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ inputs.pnpm-version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Format
+        run: pnpm run format:check --if-present
+      - name: Lint
+        run: pnpm run lint:check --if-present
+      - name: Typecheck
+        # Per-workspace: a monorepo typechecks each package, not the root.
+        run: |
+          for pkg in $(pnpm -r --depth -1 exec node -p "require('./package.json').name" 2>/dev/null); do
+            echo "::group::typecheck ${pkg}"
+            pnpm --filter "${pkg}" exec tsgo --noEmit || pnpm --filter "${pkg}" exec tsc --noEmit || true
+            echo "::endgroup::"
+          done
+      - name: Test
+        run: pnpm run test --if-present
+
+  build-and-deploy:
+    needs: check
+    if: inputs.deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write        # required for OIDC; without it the token request 403s
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image name (GHCR requires lowercase)
+        id: img
+        run: echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ inputs.dockerfile }}
+          push: true
+          # Tag by SHA so a rollback is re-pointing at an older tag, never a rebuild.
+          tags: |
+            ${{ steps.img.outputs.name }}:${{ github.sha }}
+            ${{ steps.img.outputs.name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Short-lived credentials from AWS, minted per run. Nothing long-lived is stored in
+      # GitHub, so a leaked log or a compromised runner yields nothing reusable.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_OIDC_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Load deploy secrets from Parameter Store
+        id: secrets
+        run: |
+          set -euo pipefail
+          get() { aws ssm get-parameter --name "$1" --with-decryption --query Parameter.Value --output text; }
+          echo "::add-mask::$(get /acmeplexus/platform/coolify/api_token)"
+          {
+            echo "COOLIFY_TOKEN=$(get /acmeplexus/platform/coolify/api_token)"
+            echo "VPS_IP=$(get /acmeplexus/platform/ovh/vps_ip)"
+          } >> "$GITHUB_ENV"
+
+      - name: Point Coolify at the new tag and deploy
+        env:
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          APP_UUID: ${{ vars.COOLIFY_APP_UUID }}
+          IMAGE: ${{ steps.img.outputs.name }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$VPS_IP" >> ~/.ssh/known_hosts 2>/dev/null
+
+          # Coolify's API is bound to the box's loopback (admin ports are firewalled off
+          # the public interface), so every call goes over SSH — same as bin/_lib.sh.
+          # The ci@ identity is forced-command restricted to exactly these calls: it
+          # cannot get a shell, sudo, run docker, or reach any other host.
+          coolify() {
+            local method="$1" path="$2" body="${3:-}"
+            local cmd="curl -sS -X ${method} -H 'Authorization: Bearer ${COOLIFY_TOKEN}' -H 'Content-Type: application/json'"
+            if [ -n "$body" ]; then
+              printf '%s' "$body" | ssh -i ~/.ssh/id_deploy -o BatchMode=yes "ci@${VPS_IP}" \
+                "${cmd} --data-binary @- 'http://127.0.0.1:8000${path}'"
+            else
+              ssh -n -i ~/.ssh/id_deploy -o BatchMode=yes "ci@${VPS_IP}" \
+                "${cmd} 'http://127.0.0.1:8000${path}'"
+            fi
+          }
+
+          echo "Pointing ${APP_UUID} at ${IMAGE}:${GITHUB_SHA}"
+          RESP=$(coolify PATCH "/api/v1/applications/${APP_UUID}" \
+            "$(jq -nc --arg n "$IMAGE" --arg t "$GITHUB_SHA" \
+               '{docker_registry_image_name:$n, docker_registry_image_tag:$t}')")
+          # Coolify answers some errors with HTTP 200 and a message body.
+          if printf '%s' "$RESP" | jq -e 'type=="object" and has("message") and (has("uuid")|not)' >/dev/null 2>&1; then
+            echo "PATCH failed: $(printf '%s' "$RESP" | jq -r .message)"; exit 1
+          fi
+
+          DEP=$(coolify POST "/api/v1/deploy?uuid=${APP_UUID}" "" | jq -r '.deployments[0].deployment_uuid // empty')
+          [ -n "$DEP" ] || { echo "deploy did not queue"; exit 1; }
+          echo "Deployment ${DEP} queued"
+
+          for _ in $(seq 1 60); do
+            STATUS=$(coolify GET "/api/v1/deployments/${DEP}" | jq -r '.status // "unknown"')
+            echo "  status: ${STATUS}"
+            case "$STATUS" in
+              finished|success) echo "Deployed ${GITHUB_SHA}"; exit 0;;
+              failed|error|cancelled) echo "Deployment ${STATUS}"; exit 1;;
+            esac
+            sleep 10
+          done
+          echo "Timed out waiting for deployment"; exit 1

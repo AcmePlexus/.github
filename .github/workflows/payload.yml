@@ -1,0 +1,89 @@
+name: Checks (Payload)
+
+# Reusable workflow for the `payload` archetype: Next + Payload + Postgres on Coolify.
+#
+# This is a GATE, not a deploy. Coolify already deploys these on push through its GitHub
+# App webhook, and that works — the gap was that nothing checked the code first. Every
+# Payload repo carries vitest and playwright configs that nothing has ever run.
+#
+# It deliberately does not build the image. The Payload Dockerfile runs
+#   pnpm payload migrate && pnpm payload generate:importmap && pnpm run build
+# because generateStaticParams queries the database at build time, which only works on the
+# box where <db-uuid>:5432 resolves. Moving that to a runner needs an app-architecture
+# decision first (see ci/README.md). Until then: check here, deploy from Coolify.
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        required: false
+        type: string
+        default: "22"
+      pnpm-version:
+        required: false
+        type: string
+        default: "10"
+      run-e2e:
+        description: Run Playwright. Off by default — it needs a built app and a database.
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: checks-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    services:
+      # Ephemeral Postgres so migrations and integration tests have a real schema to run
+      # against. Nothing here touches a live tenant database.
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 10s
+          --health-timeout 5s --health-retries 5
+    env:
+      DATABASE_URL: postgres://ci:ci@localhost:5432/ci
+      # Not a real secret: the checks need the variables present, not valid.
+      PAYLOAD_SECRET: ci-only-not-a-real-secret
+      PREVIEW_SECRET: ci-only-not-a-real-secret
+      CRON_SECRET: ci-only-not-a-real-secret
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ inputs.pnpm-version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm run lint --if-present
+
+      - name: Typecheck
+        # No Payload repo has a typecheck script; tsc still catches what next build hides.
+        run: pnpm exec tsc --noEmit || pnpm run typecheck --if-present
+
+      - name: Migrations apply cleanly
+        # Catches the failure that otherwise only shows up mid-deploy, when Coolify has
+        # already started replacing the container.
+        run: pnpm payload migrate --force-accept-warning
+
+      - name: Integration tests
+        run: pnpm run test:int --if-present
+
+      - name: E2E tests
+        if: inputs.run-e2e
+        run: |
+          pnpm exec playwright install --with-deps chromium
+          pnpm run test:e2e --if-present

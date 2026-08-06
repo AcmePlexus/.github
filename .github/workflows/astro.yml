@@ -1,0 +1,78 @@
+name: Build and deploy (Astro to Cloudflare Workers)
+
+# Reusable workflow for the `astro` archetype: static Astro + a git-backed CMS, deployed to
+# Cloudflare Workers. No database, no VPS, no container. Works whether the Worker lives in
+# the AcmePlexus account or the client's own — pass their account id and token.
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        required: false
+        type: string
+        default: "22"
+      pnpm-version:
+        required: false
+        type: string
+        default: "10"
+      deploy:
+        description: Deploy after the checks. false = check only (use for PRs).
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: true
+
+concurrency:
+  group: deploy-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    # The template repo itself is not a deployed site; only forks are.
+    if: ${{ !endsWith(github.repository, '/astro-starter') }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ inputs.pnpm-version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # The gate the current deploy.yml has no equivalent of: a broken build reaches
+      # production today because nothing checks first.
+      - name: Typecheck
+        run: pnpm run check --if-present
+
+      - name: Lint
+        run: pnpm run lint --if-present
+
+      - name: Build
+        run: pnpm build
+        env:
+          PUBLIC_TURNSTILE_SITE_KEY: ${{ vars.PUBLIC_TURNSTILE_SITE_KEY }}
+
+      # A SESSION KV namespace without a pinned id makes wrangler prompt interactively and
+      # the job hangs, so fail with an explanation instead.
+      - name: Check KV bindings are pinned
+        run: |
+          set -euo pipefail
+          GEN=dist/server/wrangler.json
+          [ -f "$GEN" ] || exit 0
+          if jq -e '.kv_namespaces[]? | select((.id // "") == "")' "$GEN" >/dev/null 2>&1; then
+            echo "::error::A kv_namespaces entry has no id. Pin it in wrangler.jsonc or wrangler will prompt and this job will hang."
+            exit 1
+          fi
+
+      - name: Deploy
+        if: inputs.deploy
+        run: pnpm exec wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
