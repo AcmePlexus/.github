@@ -1,44 +1,63 @@
-name: Checks (Payload)
+name: Tier 2 — Payload
 
-# Reusable workflow for the `payload` archetype: Next + Payload + Postgres on Coolify.
+# Full pipeline for a Payload tenant. Database changes are code here, so the pipeline is
+# built around that: migrations are proven against a throwaway database before merge,
+# audited against production before deploy, and a restore point is taken seconds before
+# the deploy is allowed to touch anything.
 #
-# This is a GATE, not a deploy. Coolify already deploys these on push through its GitHub
-# App webhook, and that works — the gap was that nothing checked the code first. Every
-# Payload repo carries vitest and playwright configs that nothing has ever run.
+# Why this triggers a deploy rather than building the image: the Payload Dockerfile runs
+# `payload migrate` and then `next build`, because generateStaticParams and nine index
+# pages query the database while rendering, so the build cannot run on a runner. See
+# docs/TECH-DEBT.md item 1.
 #
-# It deliberately does not build the image. The Payload Dockerfile runs
-#   pnpm payload migrate && pnpm payload generate:importmap && pnpm run build
-# because generateStaticParams queries the database at build time, which only works on the
-# box where <db-uuid>:5432 resolves. Moving that to a runner needs an app-architecture
-# decision first (see ci/README.md). Until then: check here, deploy from Coolify.
+# One consequence of that is load-bearing and worth stating plainly: because migrations
+# run inside the build, a failed migration fails the build, Coolify never swaps containers,
+# and the old one keeps serving. The gap that leaves is the restore point — last night's
+# dump can be a day stale by the time a migration goes wrong — which is what the backup
+# job below closes.
 
 on:
   workflow_call:
     inputs:
+      app-uuid:
+        description: Coolify application uuid — the app to deploy
+        required: true
+        type: string
+      db-name:
+        description: Coolify database name, e.g. inkfoundation-db
+        required: true
+        type: string
       node-version:
         required: false
         type: string
         default: "22"
       pnpm-version:
+        # Empty so pnpm/action-setup reads packageManager; passing both is a hard error.
         required: false
         type: string
-        default: "10"
+        default: ""
+      deploy:
+        description: Deploy after the checks. Pull requests should pass false.
+        required: false
+        type: boolean
+        default: true
       run-e2e:
-        description: Run Playwright. Off by default — it needs a built app and a database.
         required: false
         type: boolean
         default: false
 
 concurrency:
-  group: checks-${{ github.repository }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Two deploys of one tenant must never interleave — they would race the same database.
+  # Not cancel-in-progress: a half-finished migration is worse than a queued deploy.
+  group: tier2-${{ inputs.app-uuid }}
+  cancel-in-progress: false
 
 jobs:
+  # ---------------------------------------------------------------------------
   check:
+    name: Checks and migrations
     runs-on: ubuntu-latest
     services:
-      # Ephemeral Postgres so migrations and integration tests have a real schema to run
-      # against. Nothing here touches a live tenant database.
       postgres:
         image: postgres:16-alpine
         env:
@@ -51,7 +70,6 @@ jobs:
           --health-timeout 5s --health-retries 5
     env:
       DATABASE_URL: postgres://ci:ci@localhost:5432/ci
-      # Not a real secret: the checks need the variables present, not valid.
       PAYLOAD_SECRET: ci-only-not-a-real-secret
       PREVIEW_SECRET: ci-only-not-a-real-secret
       CRON_SECRET: ci-only-not-a-real-secret
@@ -59,24 +77,28 @@ jobs:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
         with:
-          version: ${{ inputs.pnpm-version }}
+          version: "${{ inputs.pnpm-version }}"
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
           cache: pnpm
-
       - run: pnpm install --frozen-lockfile
 
       - name: Lint
         run: pnpm run --if-present lint
 
       - name: Typecheck
-        # No Payload repo has a typecheck script; tsc still catches what next build hides.
-        run: pnpm exec tsc --noEmit || pnpm run --if-present typecheck
+        run: pnpm exec tsc --noEmit
 
-      - name: Migrations apply cleanly
-        # Catches the failure that otherwise only shows up mid-deploy, when Coolify has
-        # already started replacing the container.
+      - name: Migrations apply to an empty database
+        # The strongest guarantee available before merge: the whole chain runs from
+        # nothing. This is also the disaster-recovery path, so a break here means a
+        # rebuild from backup would fail too.
+        run: pnpm payload migrate --force-accept-warning
+
+      - name: Migrations are idempotent
+        # A second run must be a no-op. Catches a migration that re-creates something it
+        # already created — harmless on an empty database, fatal on production.
         run: pnpm payload migrate --force-accept-warning
 
       - name: Integration tests
@@ -87,3 +109,149 @@ jobs:
         run: |
           pnpm exec playwright install --with-deps chromium
           pnpm run --if-present test:e2e
+
+  # ---------------------------------------------------------------------------
+  audit:
+    name: Audit migrations against production
+    if: inputs.deploy
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reach the box
+        env:
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          VPS_IP: ${{ vars.OVH_VPS_IP }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ci && chmod 600 ~/.ssh/id_ci
+          ssh-keyscan -H "$VPS_IP" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: An applied migration must never disappear from the repo
+        env:
+          VPS_IP: ${{ vars.OVH_VPS_IP }}
+          DB: ${{ inputs.db-name }}
+        run: |
+          set -euo pipefail
+          APPLIED=$(ssh -n -i ~/.ssh/id_ci -o BatchMode=yes "ci@${VPS_IP}" "migrations ${DB}")
+          echo "Production has applied $(echo "$APPLIED" | wc -l | tr -d ' ') migration(s)."
+
+          MISSING=""
+          while read -r M; do
+            [ -z "$M" ] && continue
+            [ -f "src/migrations/${M}.ts" ] || MISSING="${MISSING} ${M}"
+          done <<< "$APPLIED"
+
+          if [ -n "$MISSING" ]; then
+            echo "::error::Applied in production but absent from this commit:${MISSING}"
+            echo "Payload records only a name, so the database keeps whatever the deleted"
+            echo "file did while the repo claims otherwise, and nothing ever surfaces the"
+            echo "disagreement. Restore the file, or write a forward migration."
+            exit 1
+          fi
+          echo "Every applied migration is still present in the repo."
+
+          PENDING=""
+          for F in src/migrations/*.ts; do
+            [ -e "$F" ] || continue
+            N=$(basename "$F" .ts)
+            [ "$N" = index ] && continue
+            echo "$APPLIED" | grep -qx "$N" || PENDING="${PENDING} ${N}"
+          done
+          if [ -n "$PENDING" ]; then
+            echo "::notice::This deploy will apply:${PENDING}"
+          else
+            echo "::notice::No pending migrations."
+          fi
+
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Back up, deploy, verify
+    if: inputs.deploy
+    needs: [check, audit]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reach the box
+        env:
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          VPS_IP: ${{ vars.OVH_VPS_IP }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ci && chmod 600 ~/.ssh/id_ci
+          ssh-keyscan -H "$VPS_IP" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Restore point, taken now
+        id: backup
+        env:
+          VPS_IP: ${{ vars.OVH_VPS_IP }}
+          DB: ${{ inputs.db-name }}
+        run: |
+          set -euo pipefail
+          OUT=$(ssh -n -i ~/.ssh/id_ci -o BatchMode=yes "ci@${VPS_IP}" \
+                 "predeploy-backup ${DB} ${GITHUB_SHA::12}")
+          KEY=$(echo "$OUT" | awk '{print $1}')
+          SIZE=$(echo "$OUT" | awk '{print $2}')
+          [ -n "$KEY" ] || { echo "::error::backup produced no key — refusing to deploy"; exit 1; }
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+          echo "::notice::Restore point $KEY ($SIZE bytes)"
+
+      - name: Deploy
+        env:
+          VPS_IP: ${{ vars.OVH_VPS_IP }}
+          APP: ${{ inputs.app-uuid }}
+        run: |
+          set -euo pipefail
+          cool() { ssh -n -i ~/.ssh/id_ci -o BatchMode=yes "ci@${VPS_IP}" "coolify $1 $2"; }
+
+          DEP=$(cool POST "/api/v1/deploy?uuid=${APP}" | jq -r '.deployments[0].deployment_uuid // empty')
+          [ -n "$DEP" ] || { echo "::error::deploy did not queue"; exit 1; }
+          echo "Deployment $DEP"
+
+          for _ in $(seq 1 90); do
+            S=$(cool GET "/api/v1/deployments/${DEP}" | jq -r '.status // "unknown"')
+            case "$S" in
+              finished|success) echo "Deployment finished."; exit 0;;
+              failed|error|cancelled)
+                echo "::error::Deployment $S — the previous container is still serving"
+                exit 1;;
+            esac
+            sleep 10
+          done
+          echo "::error::Timed out waiting for the deployment"; exit 1
+
+      - name: Health gate
+        env:
+          VPS_IP: ${{ vars.OVH_VPS_IP }}
+          APP: ${{ inputs.app-uuid }}
+        run: |
+          set -euo pipefail
+          cool() { ssh -n -i ~/.ssh/id_ci -o BatchMode=yes "ci@${VPS_IP}" "coolify $1 $2"; }
+          # Coolify says the deployment finished; this asks the application itself.
+          for _ in $(seq 1 30); do
+            S=$(cool GET "/api/v1/applications/${APP}" | jq -r '.status // "unknown"')
+            echo "  $S"
+            case "$S" in
+              running:healthy) echo "Healthy."; exit 0;;
+              exited*|*unhealthy*) echo "::error::Application reports $S"; exit 1;;
+            esac
+            sleep 10
+          done
+          echo "::error::Never reported healthy"; exit 1
+
+      - name: If anything failed, say exactly how to undo it
+        if: failure()
+        env:
+          KEY: ${{ steps.backup.outputs.key }}
+          DB: ${{ inputs.db-name }}
+        run: |
+          echo "::error::Deploy failed. The previous container is still serving."
+          echo ""
+          echo "Migrations may have been applied before the failure. The restore point"
+          echo "taken immediately before this deploy:"
+          echo ""
+          echo "  r2://acmeplexus-backups/${KEY}"
+          echo ""
+          echo "Restore it with:  ./infra backup restore ${DB} --key ${KEY}"
