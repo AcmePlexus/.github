@@ -53,12 +53,26 @@ jobs:
         run: pnpm run lint:check --if-present
       - name: Typecheck
         # Per-workspace: a monorepo typechecks each package, not the root.
+        #
+        # This must be able to FAIL. An earlier version ended the chain in `|| true`,
+        # which made the step incapable of failing — a green tick that proved nothing.
+        # tsgo is preferred and tsc is the fallback, but if neither is present that is
+        # itself a failure, not a pass.
         run: |
+          set -euo pipefail
+          FAILED=""
           for pkg in $(pnpm -r --depth -1 exec node -p "require('./package.json').name" 2>/dev/null); do
             echo "::group::typecheck ${pkg}"
-            pnpm --filter "${pkg}" exec tsgo --noEmit || pnpm --filter "${pkg}" exec tsc --noEmit || true
+            if pnpm --filter "${pkg}" exec tsgo --version >/dev/null 2>&1; then
+              pnpm --filter "${pkg}" exec tsgo --noEmit || FAILED="${FAILED} ${pkg}"
+            elif pnpm --filter "${pkg}" exec tsc --version >/dev/null 2>&1; then
+              pnpm --filter "${pkg}" exec tsc --noEmit || FAILED="${FAILED} ${pkg}"
+            else
+              echo "::error::${pkg} has no typechecker (tsgo or tsc)"; FAILED="${FAILED} ${pkg}"
+            fi
             echo "::endgroup::"
           done
+          [ -z "${FAILED}" ] || { echo "::error::typecheck failed:${FAILED}"; exit 1; }
       - name: Test
         run: pnpm run test --if-present
 
