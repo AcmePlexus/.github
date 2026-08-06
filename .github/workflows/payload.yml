@@ -68,11 +68,11 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       - name: Lint
-        run: pnpm run lint --if-present
+        run: pnpm run --if-present lint
 
       - name: Typecheck
         # No Payload repo has a typecheck script; tsc still catches what next build hides.
-        run: pnpm exec tsc --noEmit || pnpm run typecheck --if-present
+        run: pnpm exec tsc --noEmit || pnpm run --if-present typecheck
 
       - name: Migrations apply cleanly
         # Catches the failure that otherwise only shows up mid-deploy, when Coolify has
@@ -80,10 +80,10 @@ jobs:
         run: pnpm payload migrate --force-accept-warning
 
       - name: Integration tests
-        run: pnpm run test:int --if-present
+        run: pnpm run --if-present test:int
 
       - name: E2E tests
         if: inputs.run-e2e
         run: |
           pnpm exec playwright install --with-deps chromium
-          pnpm run test:e2e --if-present
+          pnpm run --if-present test:e2e

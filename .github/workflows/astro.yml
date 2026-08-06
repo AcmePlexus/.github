@@ -52,10 +52,10 @@ jobs:
       # The gate the current deploy.yml has no equivalent of: a broken build reaches
       # production today because nothing checks first.
       - name: Typecheck
-        run: pnpm run check --if-present
+        run: pnpm run --if-present check
 
       - name: Lint
-        run: pnpm run lint --if-present
+        run: pnpm run --if-present lint
 
       - name: Build
         run: pnpm build
