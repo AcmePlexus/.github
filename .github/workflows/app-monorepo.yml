@@ -16,9 +16,13 @@ on:
         type: string
         default: "22"
       pnpm-version:
+        # Empty by default so pnpm/action-setup reads packageManager from package.json.
+        # Passing a version alongside a packageManager pin is a hard error
+        # ("Multiple versions of pnpm specified"). Callers whose repo has no
+        # packageManager field pass a version here instead.
         required: false
         type: string
-        default: "10"
+        default: ""
       dockerfile:
         required: false
         type: string
