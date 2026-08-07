@@ -5,16 +5,21 @@ name: Tier 2 — Payload
 # audited against production before deploy, and a restore point is taken seconds before
 # the deploy is allowed to touch anything.
 #
-# Why this triggers a deploy rather than building the image: the Payload Dockerfile runs
-# `payload migrate` and then `next build`, because generateStaticParams and nine index
-# pages query the database while rendering, so the build cannot run on a runner. See
-# docs/TECH-DEBT.md item 1.
+# Two build modes, chosen per tenant by the `image-mode` input.
 #
-# One consequence of that is load-bearing and worth stating plainly: because migrations
-# run inside the build, a failed migration fails the build, Coolify never swaps containers,
-# and the old one keeps serving. The gap that leaves is the restore point — last night's
-# dump can be a day stale by the time a migration goes wrong — which is what the backup
-# job below closes.
+# image-mode: false (default) — Coolify builds on the box from git. This is where every
+# tenant starts and is still correct; it just means the image is built on the machine that
+# serves traffic, and cannot be reproduced or rolled back independently of the source.
+#
+# image-mode: true — this workflow builds the image and pushes it to GHCR, then points
+# Coolify at the tag. Available because Payload builds are now hermetic: `next build` no
+# longer reaches Postgres, so it runs on a runner. The tag IS the artifact, so a rollback
+# is re-pointing at the previous tag with no rebuild.
+#
+# Note what moves with it: migrations no longer run inside the build, so a bad migration no
+# longer fails the build and leaves the old container serving. That safety came for free in
+# git-build mode and has to be bought back explicitly — which is what the restore point
+# below is for, taken seconds before the deploy rather than last night.
 
 on:
   workflow_call:
@@ -42,6 +47,11 @@ on:
         type: boolean
         default: true
       run-e2e:
+        required: false
+        type: boolean
+        default: false
+      image-mode:
+        description: Build the image here and push to GHCR, instead of letting Coolify build on the box.
         required: false
         type: boolean
         default: false
@@ -186,10 +196,64 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Build the artifact once, here, and never again. Only possible because the build is
+  # hermetic: no DATABASE_URL, no build-args, so the image is a pure function of the commit.
+  image:
+    name: Build and push the image
+    if: inputs.deploy && inputs.image-mode
+    needs: [check]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write     # validated at startup, before `if:` is evaluated — must be declared
+    outputs:
+      name: ${{ steps.ref.outputs.name }}
+      tag: ${{ steps.ref.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Image reference
+        id: ref
+        run: |
+          set -euo pipefail
+          # GHCR rejects uppercase path segments and several owners here are mixed-case orgs.
+          echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # The workflow's own token. No PAT is stored anywhere for pushing; the box holds a
+          # separate read-only token for pulling.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          # Only the immutable sha tag is published. A moving `latest` would make the
+          # deployed tag ambiguous and silently break rollback-by-tag.
+          tags: ${{ steps.ref.outputs.name }}:${{ steps.ref.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
   deploy:
     name: Back up, deploy, verify
-    if: inputs.deploy
-    needs: [check, audit]
+    needs: [check, audit, image]
+    # A skipped dependency skips its dependents, so `needs: [image]` alone would disable
+    # deploys entirely whenever image-mode is off. Naming each result keeps both modes live —
+    # and because an explicit `if:` also runs on failed dependencies, success is required here
+    # rather than assumed.
+    if: >-
+      inputs.deploy && !cancelled()
+      && needs.check.result == 'success'
+      && needs.audit.result == 'success'
+      && (needs.image.result == 'success' || needs.image.result == 'skipped')
     runs-on: ubuntu-latest
     concurrency:
       # Two deploys of one tenant must never interleave — they would race the same database.
@@ -221,6 +285,26 @@ jobs:
           [ -n "$KEY" ] || { echo "::error::backup produced no key — refusing to deploy"; exit 1; }
           echo "key=$KEY" >> "$GITHUB_OUTPUT"
           echo "::notice::Restore point $KEY ($SIZE bytes)"
+
+      - name: Point Coolify at the new image
+        if: inputs.image-mode
+        env:
+          VPS_IP: ${{ vars.OVH_VPS_IP }}
+          APP: ${{ inputs.app-uuid }}
+          IMAGE: ${{ needs.image.outputs.name }}
+          TAG: ${{ needs.image.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # No -n here: the dispatcher reads a PATCH body from stdin, and -n would send it /dev/null.
+          BODY=$(jq -nc --arg n "$IMAGE" --arg t "$TAG" \
+                  '{docker_registry_image_name:$n, docker_registry_image_tag:$t}')
+          R=$(printf '%s' "$BODY" | ssh -i ~/.ssh/id_ci -o BatchMode=yes "ci@${VPS_IP}" \
+                "coolify PATCH /api/v1/applications/${APP}")
+          # Coolify answers 200 with a {"message": ...} body on some failures, so the response
+          # is read back rather than trusted.
+          echo "$R" | jq -e '.uuid // .id' >/dev/null \
+            || { echo "::error::tag patch rejected: $R"; exit 1; }
+          echo "::notice::Deploying ${IMAGE}:${TAG}"
 
       - name: Deploy
         env:
