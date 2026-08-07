@@ -46,11 +46,9 @@ on:
         type: boolean
         default: false
 
-concurrency:
-  # Two deploys of one tenant must never interleave — they would race the same database.
-  # Not cancel-in-progress: a half-finished migration is worse than a queued deploy.
-  group: tier2-${{ inputs.app-uuid }}
-  cancel-in-progress: false
+# Concurrency lives on the deploy job, not here. The `inputs` context is NOT available in a
+# reusable workflow's top-level concurrency key: GitHub rejects the file outright and every
+# caller fails with `startup_failure` before a single step runs. It is available at job level.
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -172,6 +170,11 @@ jobs:
     if: inputs.deploy
     needs: [check, audit]
     runs-on: ubuntu-latest
+    concurrency:
+      # Two deploys of one tenant must never interleave — they would race the same database.
+      # Not cancel-in-progress: a half-finished migration is worse than a queued deploy.
+      group: tier2-${{ inputs.app-uuid }}
+      cancel-in-progress: false
     steps:
       - name: Reach the box
         env:

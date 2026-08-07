@@ -33,10 +33,9 @@ on:
         type: boolean
         default: true
 
-concurrency:
-  # Never let two deploys of the same app race; cancel superseded runs on the same ref.
-  group: deploy-${{ inputs.app-name }}-${{ github.ref }}
-  cancel-in-progress: true
+# Concurrency lives on the deploy job, not here. The `inputs` context is NOT available in a
+# reusable workflow's top-level concurrency key: GitHub rejects the file outright and every
+# caller fails with `startup_failure` before a single step runs. It is available at job level.
 
 jobs:
   check:
@@ -84,6 +83,10 @@ jobs:
     needs: check
     if: inputs.deploy
     runs-on: ubuntu-latest
+    concurrency:
+      # Never let two deploys of the same app race; cancel superseded runs on the same ref.
+      group: deploy-${{ inputs.app-name }}-${{ github.ref }}
+      cancel-in-progress: true
     permissions:
       contents: read
       packages: write
