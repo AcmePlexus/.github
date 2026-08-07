@@ -240,9 +240,12 @@ jobs:
           for _ in $(seq 1 30); do
             S=$(cool GET "/api/v1/applications/${APP}" | jq -r '.status // "unknown"')
             echo "  $S"
+            # Only 'healthy' ends this early. A container is briefly exited/unhealthy while
+            # the new one starts and the old one drains, so treating that as terminal failed
+            # deploys that went on to succeed -- exactly what happened to ink and acmeplexus
+            # on 2026-08-07, both marked failed while serving the new build correctly.
             case "$S" in
               running:healthy) echo "Healthy."; exit 0;;
-              exited*|*unhealthy*) echo "::error::Application reports $S"; exit 1;;
             esac
             sleep 10
           done
