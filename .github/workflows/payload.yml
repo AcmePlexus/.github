@@ -52,9 +52,7 @@ on:
       SSH_PRIVATE_KEY:
         required: true
 
-# Concurrency lives on the deploy job, not here. The `inputs` context is NOT available in a
-# reusable workflow's top-level concurrency key: GitHub rejects the file outright and every
-# caller fails with `startup_failure` before a single step runs. It is available at job level.
+# Concurrency is job-level: `inputs` is not visible at workflow_call top-level scope.
 
 jobs:
   # ---------------------------------------------------------------------------
