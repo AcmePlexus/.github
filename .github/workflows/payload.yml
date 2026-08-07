@@ -92,6 +92,23 @@ jobs:
       - name: Typecheck
         run: pnpm exec tsc --noEmit
 
+      - name: The import map must match the config
+        # Payload resolves every admin UI component through importMap.js. A component that is
+        # missing does not throw: the admin renders a blank page, every asset returns 200, and
+        # only the server log says why. That is what happened to ink-cms on 2026-08-07, and it
+        # went unnoticed because the map had been generated in an environment where a
+        # secret-gated plugin was not loaded. Regenerating here makes the disagreement fail
+        # the build instead of the browser.
+        run: |
+          set -euo pipefail
+          pnpm payload generate:importmap
+          if ! git diff --quiet -- 'src/app/(payload)/admin/importMap.js'; then
+            echo "::error::importMap.js is out of date — run pnpm generate:importmap and commit it"
+            git --no-pager diff -- 'src/app/(payload)/admin/importMap.js' | head -40
+            exit 1
+          fi
+          echo "Import map matches the config."
+
       - name: Migrations apply to an empty database
         # The strongest guarantee available before merge: the whole chain runs from
         # nothing. This is also the disaster-recovery path, so a break here means a
