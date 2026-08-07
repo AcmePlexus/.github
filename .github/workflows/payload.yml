@@ -45,6 +45,12 @@ on:
         required: false
         type: boolean
         default: false
+    secrets:
+      # Must be declared. A caller that passes a secret this workflow does not declare is an
+      # invalid workflow file, and every run dies with `startup_failure` before any step —
+      # which is exactly what the tenant callers do, because they pass it explicitly.
+      SSH_PRIVATE_KEY:
+        required: true
 
 # Concurrency lives on the deploy job, not here. The `inputs` context is NOT available in a
 # reusable workflow's top-level concurrency key: GitHub rejects the file outright and every

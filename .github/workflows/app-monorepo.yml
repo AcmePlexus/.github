@@ -32,6 +32,15 @@ on:
         required: false
         type: boolean
         default: true
+    secrets:
+      SSH_PRIVATE_KEY:
+        required: false
+
+# The deploy job needs packages:write and id-token:write. A reusable workflow cannot hold
+# more permission than its caller grants, and GitHub checks that when the run starts —
+# before `if: inputs.deploy` is evaluated — so a caller left on the default read-only token
+# fails at startup even when it never intended to deploy. Callers must grant them; see
+# the block in bin/tenant-new.sh that writes the caller workflow.
 
 # Concurrency lives on the deploy job, not here. The `inputs` context is NOT available in a
 # reusable workflow's top-level concurrency key: GitHub rejects the file outright and every
