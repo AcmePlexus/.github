@@ -295,6 +295,17 @@ jobs:
           TAG: ${{ needs.image.outputs.tag }}
         run: |
           set -euo pipefail
+          # An app still on build_pack=dockerfile builds from git and ignores these fields, so
+          # patching it writes registry settings onto an app that will never read them. Skip
+          # instead: that makes image-mode safe to switch on BEFORE the app is converted, which
+          # is the only way to get a first image into the registry to convert it with.
+          PACK=$(ssh -n -i ~/.ssh/id_ci -o BatchMode=yes "ci@${VPS_IP}" \
+                   "coolify GET /api/v1/applications/${APP}" | jq -r '.build_pack // "unknown"')
+          if [ "$PACK" != "dockerimage" ]; then
+            echo "::notice::${IMAGE}:${TAG} pushed. App is build_pack=${PACK}, so Coolify will build from git; not patching the tag."
+            exit 0
+          fi
+
           # No -n here: the dispatcher reads a PATCH body from stdin, and -n would send it /dev/null.
           BODY=$(jq -nc --arg n "$IMAGE" --arg t "$TAG" \
                   '{docker_registry_image_name:$n, docker_registry_image_tag:$t}')
