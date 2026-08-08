@@ -145,6 +145,10 @@ jobs:
     if: inputs.deploy
     needs: check
     runs-on: ubuntu-latest
+    outputs:
+      # Whether this deploy will change the schema. The deploy job uses it to decide if a
+      # restore point is warranted.
+      pending: ${{ steps.audit.outputs.pending }}
     steps:
       - uses: actions/checkout@v4
 
@@ -159,6 +163,7 @@ jobs:
           ssh-keyscan -H "$VPS_IP" >> ~/.ssh/known_hosts 2>/dev/null
 
       - name: An applied migration must never disappear from the repo
+        id: audit
         env:
           VPS_IP: ${{ vars.OVH_VPS_IP }}
           DB: ${{ inputs.db-name }}
@@ -194,6 +199,9 @@ jobs:
           else
             echo "::notice::No pending migrations."
           fi
+          # Trimmed, so an empty value is genuinely empty for the deploy job's `if`.
+          echo "pending=$(echo "$PENDING" | xargs)" >> "$GITHUB_OUTPUT"
+
 
   # ---------------------------------------------------------------------------
   # ---------------------------------------------------------------------------
@@ -279,6 +287,15 @@ jobs:
 
       - name: Restore point, taken now
         id: backup
+        # Only when the schema is about to change. The restore point exists because a bad
+        # migration cannot be undone by redeploying -- but a commit with no pending migrations
+        # cannot apply one, so there is nothing for it to protect against. Content and code
+        # roll back by re-pointing at the previous tag, which needs no dump.
+        #
+        # `pending` comes from the audit's comparison of the repo against what production has
+        # actually applied, not from a diff of this commit: a migration added days ago and
+        # never deployed still counts.
+        if: needs.audit.outputs.pending != ''
         env:
           VPS_IP: ${{ vars.OVH_VPS_IP }}
           DB: ${{ inputs.db-name }}
@@ -377,6 +394,13 @@ jobs:
         run: |
           echo "::error::Deploy failed. The previous container is still serving."
           echo ""
+          if [ -z "${KEY}" ]; then
+            # No restore point because no migration was pending, so the schema is untouched
+            # and there is nothing to restore. Say so plainly rather than printing an empty path.
+            echo "This deploy applied no migrations, so the database is unchanged."
+            echo "Roll back by re-pointing the app at the previous image tag."
+            exit 0
+          fi
           echo "Migrations may have been applied before the failure. The restore point"
           echo "taken immediately before this deploy:"
           echo ""
