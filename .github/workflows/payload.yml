@@ -202,7 +202,13 @@ jobs:
   image:
     name: Build and push the image
     if: inputs.deploy && inputs.image-mode
-    needs: [check]
+    # Deliberately depends on nothing, so it starts at the same moment as `check` instead of
+    # queueing behind it. The image is the slowest job and the checks do not inform it -- the
+    # build is a pure function of the source either way.
+    #
+    # Nothing unchecked can reach production from this: `deploy` requires check AND audit to
+    # have succeeded before it will patch a tag. The worst case is an image pushed for a commit
+    # that failed lint, which costs a little registry space and is never deployed.
     runs-on: ubuntu-latest
     permissions:
       contents: read
