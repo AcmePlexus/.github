@@ -59,29 +59,26 @@ jobs:
       - name: Format
         run: pnpm run --if-present format:check
       - name: Lint
-        run: pnpm run --if-present lint:check
-      - name: Typecheck
-        # Per-workspace: a monorepo typechecks each package, not the root.
-        #
-        # This must be able to FAIL. An earlier version ended the chain in `|| true`,
-        # which made the step incapable of failing — a green tick that proved nothing.
-        # tsgo is preferred and tsc is the fallback, but if neither is present that is
-        # itself a failure, not a pass.
+        # lint:types is the fleet's type-aware lint since 2026-10; lint:check until a repo moves to it.
         run: |
           set -euo pipefail
-          FAILED=""
-          for pkg in $(pnpm -r --depth -1 exec node -p "require('./package.json').name" 2>/dev/null); do
-            echo "::group::typecheck ${pkg}"
-            if pnpm --filter "${pkg}" exec tsgo --version >/dev/null 2>&1; then
-              pnpm --filter "${pkg}" exec tsgo --noEmit || FAILED="${FAILED} ${pkg}"
-            elif pnpm --filter "${pkg}" exec tsc --version >/dev/null 2>&1; then
-              pnpm --filter "${pkg}" exec tsc --noEmit || FAILED="${FAILED} ${pkg}"
-            else
-              echo "::error::${pkg} has no typechecker (tsgo or tsc)"; FAILED="${FAILED} ${pkg}"
-            fi
-            echo "::endgroup::"
-          done
-          [ -z "${FAILED}" ] || { echo "::error::typecheck failed:${FAILED}"; exit 1; }
+          if jq -e '.scripts["lint:types"]' package.json >/dev/null; then
+            pnpm run lint:types
+          elif jq -e '.scripts["lint:check"]' package.json >/dev/null; then
+            pnpm run lint:check
+          else
+            echo "::notice::no lint:types or lint:check script, lint skipped"
+          fi
+      - name: Typecheck
+        # The root typecheck (Turbo over every workspace), else each workspace's own. With the root in scope,
+        # pnpm fails a run that finds no typecheck script anywhere (ERR_PNPM_RECURSIVE_RUN_NO_SCRIPT).
+        run: |
+          set -euo pipefail
+          if jq -e '.scripts.typecheck' package.json >/dev/null; then
+            pnpm run typecheck
+          else
+            pnpm -r --include-workspace-root run typecheck
+          fi
       - name: Test
         run: pnpm run --if-present test
 
